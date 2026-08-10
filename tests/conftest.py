@@ -83,8 +83,9 @@ except ModuleNotFoundError:
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
                         "content": [
-                            block.model_dump(exclude_none=True) for block in r.content if block.text
+                            block.model_dump(exclude_none=True) for block in r.content
                         ],
+                        "is_error": r.is_error,
                     }
                 ],
             }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 from types import SimpleNamespace
@@ -26,11 +27,11 @@ class MnemosAnthropicAdapter:
     ) -> MnemosAnthropicAdapter:
         """Discover MNEMOS MCP tools, return ready adapter. Uses mnemos_bridge_core.McpClient."""
         client = McpClient.from_url(mcp_url, token=mcp_token, timeout=timeout)
-        await client.__aenter__()
 
         try:
+            await client.__aenter__()
             tools = await client.list_tools()
-        except Exception:
+        except BaseException:
             await client.__aexit__(None, None, None)
             raise
 
@@ -121,7 +122,8 @@ def _tool_result_block(rendered: dict[str, Any], tool_use_id: str) -> dict[str, 
     return {
         "type": "tool_result",
         "tool_use_id": str(block.get("tool_use_id") or tool_use_id),
-        "content": [{"type": "text", "text": _render_text(block.get("content"))}],
+        "content": _anthropic_content(block.get("content")),
+        "is_error": bool(block.get("is_error", False)),
     }
 
 
@@ -134,6 +136,33 @@ def _first_tool_result_content(rendered: dict[str, Any], tool_use_id: str) -> di
                     return item
 
     raise ValueError("ResultRenderer.to_anthropic_message() did not return a tool_result block")
+
+
+def _anthropic_content(content: Any) -> list[dict[str, Any]]:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        return [block for item in content for block in _anthropic_content(item)]
+    if isinstance(content, dict):
+        if content.get("type") == "image":
+            data = content.get("data", b"")
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                data = base64.b64encode(data).decode("ascii")
+            return [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": content.get("mime_type") or "image/png",
+                        "data": str(data),
+                    },
+                }
+            ]
+        if content.get("type") == "text":
+            return [{"type": "text", "text": str(content.get("text") or "")}]
+    return [{"type": "text", "text": _render_text(content)}]
 
 
 def _render_text(content: Any) -> str:
