@@ -92,6 +92,57 @@ async def test_handle_tool_use_converts_image_content_to_anthropic_source() -> N
 
 
 @pytest.mark.asyncio
+async def test_handle_tool_use_preserves_image_already_rendered_by_core(
+    monkeypatch: Any,
+) -> None:
+    client = FakeMcpClient()
+    rendered_image = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": base64.b64encode(b"jpeg bytes").decode("ascii"),
+        },
+    }
+    monkeypatch.setattr(
+        adapter_module.ResultRenderer,
+        "to_anthropic_message",
+        lambda result, tool_use_id: {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": [rendered_image],
+                    "is_error": False,
+                }
+            ],
+        },
+    )
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_image", "name": "chart", "input": {}}
+    )
+
+    assert result["content"] == [rendered_image]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_input", [[], "", 0, False])
+async def test_handle_tool_use_rejects_falsey_non_dict_input(invalid_input: Any) -> None:
+    client = FakeMcpClient()
+    adapter = MnemosAnthropicAdapter(client)
+
+    with pytest.raises(TypeError, match="input must be a dict"):
+        await adapter.handle_tool_use(
+            {"id": "toolu_invalid", "name": "optional_side_effect", "input": invalid_input}
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_connect_closes_client_when_tool_discovery_is_cancelled(monkeypatch: Any) -> None:
     class CancellingClient:
         def __init__(self) -> None:

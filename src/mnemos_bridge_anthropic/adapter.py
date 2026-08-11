@@ -53,7 +53,9 @@ class MnemosAnthropicAdapter:
         """Dispatch an Anthropic ToolUseBlock or plain dict and return a tool_result block."""
         tool_use_id = _get_value(tool_use_block, "id")
         name = _get_value(tool_use_block, "name")
-        arguments = _get_value(tool_use_block, "input") or {}
+        arguments = _get_value(tool_use_block, "input")
+        if arguments is None:
+            arguments = {}
 
         if not tool_use_id:
             raise ValueError("tool_use_block must include an id")
@@ -147,6 +149,8 @@ def _anthropic_content(content: Any) -> list[dict[str, Any]]:
         return [block for item in content for block in _anthropic_content(item)]
     if isinstance(content, dict):
         if content.get("type") == "image":
+            if isinstance(content.get("source"), dict):
+                return [content]
             data = content.get("data", b"")
             if isinstance(data, (bytes, bytearray, memoryview)):
                 data = base64.b64encode(data).decode("ascii")
