@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -59,3 +60,36 @@ async def test_anthropic_tools_are_minimal_mcp_passthrough_shape() -> None:
         assert isinstance(tool["description"], str)
         assert isinstance(tool["input_schema"], dict)
         assert tool["input_schema"]["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tools_alias_unsafe_names_and_dispatch_original_name() -> None:
+    unsafe_names = [
+        "admin.tools.list",
+        "x" * 65,
+        "admin_tools_list",
+    ]
+    tools = [
+        {"name": name, "description": "Tool", "inputSchema": {"type": "object"}}
+        for name in unsafe_names
+    ]
+    client = FakeMcpClient(tools)
+    calls: list[str] = []
+
+    async def call_tool(name: str, args: dict[str, Any]) -> Any:
+        calls.append(name)
+        return SimpleNamespace(content=[], is_error=True)
+
+    client.call_tool = call_tool  # type: ignore[attr-defined]
+    adapter = MnemosAnthropicAdapter(client, tools)
+
+    anthropic_tools = await adapter.anthropic_tools()
+    aliases = [tool["name"] for tool in anthropic_tools]
+
+    assert len(set(aliases)) == len(unsafe_names)
+    assert all(re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", alias) for alias in aliases)
+    assert aliases[2] == "admin_tools_list"
+
+    await adapter.handle_tool_use({"id": "toolu_alias", "name": aliases[0], "input": {}})
+
+    assert calls == ["admin.tools.list"]

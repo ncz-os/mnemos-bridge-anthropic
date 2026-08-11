@@ -66,12 +66,158 @@ async def test_handle_tool_use_preserves_tool_error_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_tool_use_converts_image_content_to_anthropic_source() -> None:
+async def test_handle_tool_use_recognizes_mnemos_failure_envelope() -> None:
     client = FakeMcpClient()
 
     async def call_tool(name: str, args: dict[str, Any]) -> ToolResult:
         return ToolResult(
-            content=[ContentBlock(type="image", data=b"image bytes", mime_type="image/png")]
+            content=[
+                ContentBlock(
+                    type="text",
+                    text='{"success": false, "error": "Rate limit exceeded"}',
+                )
+            ],
+            is_error=False,
+        )
+
+    client.call_tool = call_tool  # type: ignore[method-assign]
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_failure", "name": "create_memory", "input": {}}
+    )
+
+    assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_marks_empty_success_as_untranslatable() -> None:
+    client = FakeMcpClient()
+
+    async def call_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(content=[], is_error=False)
+
+    client.call_tool = call_tool  # type: ignore[method-assign]
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_empty", "name": "read_resource", "input": {}}
+    )
+
+    assert result["is_error"] is True
+    assert "no translatable content" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_translates_embedded_text_resource(monkeypatch: Any) -> None:
+    client = FakeMcpClient()
+    monkeypatch.setattr(
+        adapter_module.ResultRenderer,
+        "to_anthropic_message",
+        lambda result, tool_use_id: {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "memory://record/123",
+                        "mimeType": "text/plain",
+                        "text": "embedded memory text",
+                    },
+                }
+            ],
+            "is_error": False,
+        },
+    )
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_resource", "name": "read_resource", "input": {}}
+    )
+
+    assert result["is_error"] is False
+    assert result["content"] == [{"type": "text", "text": "embedded memory text"}]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_translates_embedded_pdf_resource(monkeypatch: Any) -> None:
+    client = FakeMcpClient()
+    encoded_pdf = base64.b64encode(b"%PDF-1.7").decode("ascii")
+    monkeypatch.setattr(
+        adapter_module.ResultRenderer,
+        "to_anthropic_message",
+        lambda result, tool_use_id: {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "memory://report/123",
+                        "mimeType": "application/pdf",
+                        "blob": encoded_pdf,
+                    },
+                }
+            ],
+            "is_error": False,
+        },
+    )
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_resource", "name": "read_resource", "input": {}}
+    )
+
+    assert result["is_error"] is False
+    assert result["content"] == [
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": encoded_pdf,
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_rejects_audio_as_explicit_error(monkeypatch: Any) -> None:
+    client = FakeMcpClient()
+    monkeypatch.setattr(
+        adapter_module.ResultRenderer,
+        "to_anthropic_message",
+        lambda result, tool_use_id: {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": [{"type": "audio", "mimeType": "audio/wav", "data": "AAAA"}],
+            "is_error": False,
+        },
+    )
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_audio", "name": "speech", "input": {}}
+    )
+
+    assert result["is_error"] is True
+    assert "audio" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "media_type",
+    ["image/jpeg", "image/png", "image/gif", "image/webp"],
+)
+async def test_handle_tool_use_converts_image_content_to_anthropic_source(
+    media_type: str,
+) -> None:
+    client = FakeMcpClient()
+
+    async def call_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(
+            content=[ContentBlock(type="image", data=b"image bytes", mime_type=media_type)]
         )
 
     client.call_tool = call_tool  # type: ignore[method-assign]
@@ -84,7 +230,7 @@ async def test_handle_tool_use_converts_image_content_to_anthropic_source() -> N
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/png",
+                "media_type": media_type,
                 "data": base64.b64encode(b"image bytes").decode("ascii"),
             },
         }
@@ -126,6 +272,27 @@ async def test_handle_tool_use_preserves_image_already_rendered_by_core(
     )
 
     assert result["content"] == [rendered_image]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_rejects_unsupported_image_mime_type() -> None:
+    client = FakeMcpClient()
+
+    async def call_tool(name: str, args: dict[str, Any]) -> ToolResult:
+        return ToolResult(
+            content=[ContentBlock(type="image", data=b"svg", mime_type="image/svg+xml")]
+        )
+
+    client.call_tool = call_tool  # type: ignore[method-assign]
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_svg", "name": "chart", "input": {}}
+    )
+
+    assert result["is_error"] is True
+    assert result["content"][0]["type"] == "text"
+    assert "image/svg+xml" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
