@@ -181,16 +181,14 @@ def _tool_result_block(rendered: dict[str, Any], tool_use_id: str) -> dict[str, 
         content = [{"type": "text", "text": str(exc)}]
         is_error = True
 
-    if not content:
-        content = [{"type": "text", "text": "MCP tool returned no translatable content."}]
-        is_error = True
-
-    return {
+    result = {
         "type": "tool_result",
         "tool_use_id": str(block.get("tool_use_id") or tool_use_id),
-        "content": content,
         "is_error": is_error,
     }
+    if content:
+        result["content"] = content
+    return result
 
 
 def _first_tool_result_content(rendered: dict[str, Any], tool_use_id: str) -> dict[str, Any]:

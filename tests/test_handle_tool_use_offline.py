@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from mnemos_bridge_core import ContentBlock, ToolResult
+from mnemos_bridge_core import ContentBlock, McpClient, ToolResult
 
 from mnemos_bridge_anthropic import MnemosAnthropicAdapter
 from mnemos_bridge_anthropic import adapter as adapter_module
@@ -91,7 +92,7 @@ async def test_handle_tool_use_recognizes_mnemos_failure_envelope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_tool_use_marks_empty_success_as_untranslatable() -> None:
+async def test_handle_tool_use_preserves_empty_success() -> None:
     client = FakeMcpClient()
 
     async def call_tool(name: str, args: dict[str, Any]) -> ToolResult:
@@ -104,8 +105,39 @@ async def test_handle_tool_use_marks_empty_success_as_untranslatable() -> None:
         {"id": "toolu_empty", "name": "read_resource", "input": {}}
     )
 
-    assert result["is_error"] is True
-    assert "no translatable content" in result["content"][0]["text"]
+    assert result["is_error"] is False
+    assert "content" not in result
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_translates_embedded_text_through_real_core_mapping() -> None:
+    if not hasattr(McpClient, "_map_content"):
+        pytest.skip("requires the real mnemos-bridge-core package")
+
+    class CoreMappingClient(FakeMcpClient):
+        async def call_tool(self, name: str, args: dict[str, Any]) -> ToolResult:
+            self.calls.append((name, args))
+            item = SimpleNamespace(
+                type="resource",
+                resource=SimpleNamespace(
+                    uri="memory://record/123",
+                    mimeType="text/plain",
+                    text="embedded memory text",
+                ),
+            )
+            block = McpClient._map_content(item)
+            assert block is not None
+            return ToolResult(content=[block], is_error=False)
+
+    client = CoreMappingClient()
+    adapter = MnemosAnthropicAdapter(client)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_resource", "name": "read_resource", "input": {}}
+    )
+
+    assert result["is_error"] is False
+    assert result["content"] == [{"type": "text", "text": "embedded memory text"}]
 
 
 @pytest.mark.asyncio
