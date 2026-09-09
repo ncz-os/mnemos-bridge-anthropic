@@ -28,6 +28,25 @@ class FakeMcpClient:
             is_error=False,
         )
 
+    async def list_tools(self) -> list[dict[str, Any]]:
+        names = (
+            "search_memories",
+            "write",
+            "create_memory",
+            "read_resource",
+            "speech",
+            "chart",
+            "optional_side_effect",
+        )
+        return [
+            {
+                "name": name,
+                "description": "Test tool",
+                "inputSchema": {"type": "object"},
+            }
+            for name in names
+        ]
+
 
 @pytest.mark.asyncio
 async def test_handle_tool_use_dispatches_and_returns_tool_result_block() -> None:
@@ -107,6 +126,45 @@ async def test_handle_tool_use_preserves_empty_success() -> None:
 
     assert result["is_error"] is False
     assert "content" not in result
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_rejects_deeply_nested_content_cleanly(
+    monkeypatch: Any,
+) -> None:
+    client = FakeMcpClient()
+    nested: Any = {"type": "text", "text": "unreachable"}
+    for _ in range(5_000):
+        nested = [nested]
+    monkeypatch.setattr(
+        adapter_module.ResultRenderer,
+        "to_anthropic_message",
+        lambda result, tool_use_id: {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": nested,
+            "is_error": False,
+        },
+    )
+    adapter = MnemosAnthropicAdapter(client, max_content_depth=64)
+
+    result = await adapter.handle_tool_use(
+        {"id": "toolu_deep", "name": "read_resource", "input": {}}
+    )
+
+    assert client.calls == [("read_resource", {})]
+    assert result["is_error"] is True
+    assert result["content"] == [
+        {
+            "type": "text",
+            "text": "MCP tool result exceeds the maximum content nesting depth of 64.",
+        }
+    ]
+
+
+def test_adapter_rejects_unsafe_max_content_depth() -> None:
+    with pytest.raises(ValueError, match="must be between 0 and 100"):
+        MnemosAnthropicAdapter(FakeMcpClient(), max_content_depth=101)
 
 
 @pytest.mark.asyncio

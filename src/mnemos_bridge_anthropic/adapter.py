@@ -15,19 +15,37 @@ _ANTHROPIC_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _ANTHROPIC_IMAGE_MEDIA_TYPES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "image/webp"}
 )
+_DEFAULT_MAX_CONTENT_DEPTH = 64
+_MAX_CONTENT_DEPTH = 100
 
 
 class _UnsupportedContentError(ValueError):
     pass
 
 
+def _validate_max_content_depth(max_content_depth: int) -> None:
+    if isinstance(max_content_depth, bool) or not isinstance(max_content_depth, int):
+        raise TypeError("max_content_depth must be an integer")
+    if not 0 <= max_content_depth <= _MAX_CONTENT_DEPTH:
+        raise ValueError(f"max_content_depth must be between 0 and {_MAX_CONTENT_DEPTH}")
+
+
 class MnemosAnthropicAdapter:
     """Anthropic adapter for MNEMOS MCP tools."""
 
-    def __init__(self, mcp_client: McpClient, tools: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        mcp_client: McpClient,
+        tools: list[Any] | None = None,
+        *,
+        max_content_depth: int = _DEFAULT_MAX_CONTENT_DEPTH,
+    ) -> None:
+        _validate_max_content_depth(max_content_depth)
         self._client = mcp_client
         self._tools = tools
         self._tool_alias_to_mcp: dict[str, str] = {}
+        self._tool_aliases_initialized = False
+        self._max_content_depth = max_content_depth
         self._closed = False
 
     @classmethod
@@ -37,8 +55,10 @@ class MnemosAnthropicAdapter:
         mcp_token: str,
         *,
         timeout: float = 30,
+        max_content_depth: int = _DEFAULT_MAX_CONTENT_DEPTH,
     ) -> MnemosAnthropicAdapter:
         """Discover MNEMOS MCP tools, return ready adapter. Uses mnemos_bridge_core.McpClient."""
+        _validate_max_content_depth(max_content_depth)
         client = McpClient.from_url(mcp_url, token=mcp_token, timeout=timeout)
 
         try:
@@ -48,7 +68,7 @@ class MnemosAnthropicAdapter:
             await client.__aexit__(None, None, None)
             raise
 
-        return cls(client, tools)
+        return cls(client, tools, max_content_depth=max_content_depth)
 
     async def anthropic_tools(self) -> list[dict[str, Any]]:
         """Return Anthropic-shape tool list.
@@ -65,6 +85,7 @@ class MnemosAnthropicAdapter:
         self._tool_alias_to_mcp = {
             alias: tool["name"] for alias, tool in zip(aliases, translated_tools, strict=True)
         }
+        self._tool_aliases_initialized = True
         return [
             {**tool, "name": alias}
             for alias, tool in zip(aliases, translated_tools, strict=True)
@@ -85,10 +106,19 @@ class MnemosAnthropicAdapter:
         if not isinstance(arguments, dict):
             raise TypeError("tool_use_block input must be a dict")
 
-        mcp_name = self._tool_alias_to_mcp.get(name, name)
+        if not self._tool_aliases_initialized:
+            await self.anthropic_tools()
+        try:
+            mcp_name = self._tool_alias_to_mcp[name]
+        except KeyError:
+            raise ValueError(f"tool {name!r} is not in the advertised Anthropic tool set") from None
         result = await self._client.call_tool(mcp_name, arguments)
         rendered = ResultRenderer.to_anthropic_message(result, tool_use_id)
-        return _tool_result_block(rendered, tool_use_id)
+        return _tool_result_block(
+            rendered,
+            tool_use_id,
+            max_content_depth=self._max_content_depth,
+        )
 
     async def aclose(self) -> None:
         """Close the underlying MCP client session."""
@@ -167,16 +197,21 @@ def _get_value(value: Any, key: str) -> Any:
     return getattr(value, key, None)
 
 
-def _tool_result_block(rendered: dict[str, Any], tool_use_id: str) -> dict[str, Any]:
+def _tool_result_block(
+    rendered: dict[str, Any],
+    tool_use_id: str,
+    *,
+    max_content_depth: int = _DEFAULT_MAX_CONTENT_DEPTH,
+) -> dict[str, Any]:
     block = rendered
     if rendered.get("type") != "tool_result":
         block = _first_tool_result_content(rendered, tool_use_id)
 
-    is_error = bool(block.get("is_error", False)) or _content_reports_mnemos_error(
-        block.get("content")
-    )
+    is_error = bool(block.get("is_error", False))
     try:
-        content = _anthropic_content(block.get("content"))
+        raw_content = block.get("content")
+        content = _anthropic_content(raw_content, max_depth=max_content_depth)
+        is_error = is_error or _content_reports_mnemos_error(raw_content)
     except _UnsupportedContentError as exc:
         content = [{"type": "text", "text": str(exc)}]
         is_error = True
@@ -202,13 +237,22 @@ def _first_tool_result_content(rendered: dict[str, Any], tool_use_id: str) -> di
     raise ValueError("ResultRenderer.to_anthropic_message() did not return a tool_result block")
 
 
-def _anthropic_content(content: Any) -> list[dict[str, Any]]:
+def _anthropic_content(
+    content: Any,
+    *,
+    max_depth: int = _DEFAULT_MAX_CONTENT_DEPTH,
+) -> list[dict[str, Any]]:
+    _validate_content_depth(content, max_depth=max_depth)
+    return _anthropic_content_unchecked(content)
+
+
+def _anthropic_content_unchecked(content: Any) -> list[dict[str, Any]]:
     if content is None:
         return []
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if isinstance(content, list):
-        return [block for item in content for block in _anthropic_content(item)]
+        return [block for item in content for block in _anthropic_content_unchecked(item)]
     if isinstance(content, dict):
         if content.get("type") == "image":
             if isinstance(content.get("source"), dict):
@@ -275,6 +319,26 @@ def _anthropic_content(content: Any) -> list[dict[str, Any]]:
                 "MCP tool returned audio content that Anthropic tool results cannot represent."
             )
     return [{"type": "text", "text": _render_text(content)}]
+
+
+def _validate_content_depth(content: Any, *, max_depth: int) -> None:
+    stack = [(content, 0)]
+    greatest_depth_by_id: dict[int, int] = {}
+    while stack:
+        value, depth = stack.pop()
+        if depth > max_depth:
+            raise _UnsupportedContentError(
+                f"MCP tool result exceeds the maximum content nesting depth of {max_depth}."
+            )
+        if not isinstance(value, (list, dict)):
+            continue
+
+        value_id = id(value)
+        if greatest_depth_by_id.get(value_id, -1) >= depth:
+            continue
+        greatest_depth_by_id[value_id] = depth
+        children = value if isinstance(value, list) else value.values()
+        stack.extend((child, depth + 1) for child in children)
 
 
 def _anthropic_image_media_type(media_type: Any) -> str:
