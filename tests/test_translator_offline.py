@@ -93,3 +93,45 @@ async def test_anthropic_tools_alias_unsafe_names_and_dispatch_original_name() -
     await adapter.handle_tool_use({"id": "toolu_alias", "name": aliases[0], "input": {}})
 
     assert calls == ["admin.tools.list"]
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_use_allowlist_resolves_aliases_and_rejects_unadvertised_alias() -> None:
+    allowed_tools = [
+        {
+            "name": "namespace/read",
+            "description": "Allowed tool",
+            "inputSchema": {"type": "object"},
+        }
+    ]
+    client = FakeMcpClient(allowed_tools)
+    calls: list[str] = []
+
+    async def call_tool(name: str, args: dict[str, Any]) -> Any:
+        calls.append(name)
+        return SimpleNamespace(content=[], is_error=False)
+
+    client.call_tool = call_tool  # type: ignore[attr-defined]
+    adapter = MnemosAnthropicAdapter(client, allowed_tools)
+    allowed_alias = (await adapter.anthropic_tools())[0]["name"]
+
+    denied_tools = [
+        {
+            "name": "namespace/write",
+            "description": "Denied tool",
+            "inputSchema": {"type": "object"},
+        }
+    ]
+    denied_alias = (
+        await MnemosAnthropicAdapter(FakeMcpClient(denied_tools), denied_tools).anthropic_tools()
+    )[0]["name"]
+
+    await adapter.handle_tool_use({"id": "toolu_allowed_alias", "name": allowed_alias, "input": {}})
+    with pytest.raises(ValueError, match="not in the advertised Anthropic tool set"):
+        await adapter.handle_tool_use(
+            {"id": "toolu_denied_alias", "name": denied_alias, "input": {}}
+        )
+
+    assert allowed_alias != "namespace/read"
+    assert denied_alias != "namespace/write"
+    assert calls == ["namespace/read"]
